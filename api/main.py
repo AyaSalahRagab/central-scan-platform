@@ -38,4 +38,3 @@ def status(task_id: str):
         "state": result.state,
         "result": str(result.result) if result.result else None
     }
-``
