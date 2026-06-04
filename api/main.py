@@ -13,6 +13,8 @@ celery_app = Celery(
 
 class ScanRequest(BaseModel):
     repo_url: str
+    product_name: str
+    engagement_name: str
     target_url: str | None = None
 
 @app.post("/scan")
@@ -27,3 +29,13 @@ def scan(req: ScanRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/status/{task_id}")
+def status(task_id: str):
+    result = celery_app.AsyncResult(task_id)
+    return {
+        "task_id": task_id,
+        "state": result.state,
+        "result": str(result.result) if result.result else None
+    }
+``
