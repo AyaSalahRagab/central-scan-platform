@@ -7,14 +7,13 @@ import requests
 import json
 from datetime import datetime
 
-# ✅ Celery Config (مهم جدًا)
+# ✅ Celery Config
 celery_app = Celery(
     "tasks",
     broker=os.getenv("REDIS_URL"),
     backend=os.getenv("REDIS_URL")
 )
 
-# ✅ Env variables
 DOJO_URL = os.getenv("DEFECTDOJO_URL")
 DOJO_TOKEN = os.getenv("DEFECTDOJO_TOKEN")
 
@@ -25,7 +24,7 @@ DOJO_TOKEN = os.getenv("DEFECTDOJO_TOKEN")
 def run_cmd(cmd):
     result = subprocess.run(cmd, shell=True, text=True, capture_output=True)
     if result.returncode != 0:
-        raise Exception(f"Command failed:\n{result.stderr}")
+        raise Exception(result.stderr)
     return result.stdout
 
 
@@ -36,47 +35,7 @@ def dojo_headers():
 
 
 # -------------------------
-# ✅ Parse Reports
-# -------------------------
-
-def parse_trivy(file):
-    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-
-    try:
-        data = json.load(open(file))
-        for r in data.get("Results", []):
-            for v in r.get("Vulnerabilities", []):
-                sev = v.get("Severity", "")
-                if sev in counts:
-                    counts[sev] += 1
-    except:
-        pass
-
-    return counts
-
-
-def parse_semgrep(file):
-    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-
-    try:
-        data = json.load(open(file))
-        for r in data.get("results", []):
-            sev = r.get("extra", {}).get("severity", "").upper()
-
-            if sev == "ERROR":
-                counts["HIGH"] += 1
-            elif sev == "WARNING":
-                counts["MEDIUM"] += 1
-            elif sev == "INFO":
-                counts["LOW"] += 1
-    except:
-        pass
-
-    return counts
-
-
-# -------------------------
-# ✅ DefectDojo Upload
+# ✅ DefectDojo Upload (IMPORTANT)
 # -------------------------
 
 def upload(scan_type, file_path, engagement_id):
@@ -98,6 +57,45 @@ def upload(scan_type, file_path, engagement_id):
 
 
 # -------------------------
+# ✅ Parsing (NEW ✅)
+# -------------------------
+
+def empty_counts():
+    return {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+
+
+def parse_trivy(file):
+    counts = empty_counts()
+    try:
+        data = json.load(open(file))
+        for r in data.get("Results", []):
+            for v in r.get("Vulnerabilities", []):
+                sev = v.get("Severity", "").upper()
+                if sev in counts:
+                    counts[sev] += 1
+    except:
+        pass
+    return counts
+
+
+def parse_semgrep(file):
+    counts = empty_counts()
+    try:
+        data = json.load(open(file))
+        for r in data.get("results", []):
+            sev = r.get("extra", {}).get("severity", "").upper()
+            if sev == "ERROR":
+                counts["HIGH"] += 1
+            elif sev == "WARNING":
+                counts["MEDIUM"] += 1
+            elif sev == "INFO":
+                counts["LOW"] += 1
+    except:
+        pass
+    return counts
+
+
+# -------------------------
 # ✅ MAIN TASK
 # -------------------------
 
@@ -109,7 +107,6 @@ def run_scan(req):
     engagement_name = req["engagement_name"]
     target_url = req.get("target_url")
 
-    # ✅ Working dir
     workdir = Path("/tmp/scan")
     if workdir.exists():
         shutil.rmtree(workdir)
@@ -117,41 +114,41 @@ def run_scan(req):
 
     repo_dir = workdir / "repo"
 
-    # ✅ Clone
+    # ✅ Clone repo
     run_cmd(f"git clone {repo_url} {repo_dir}")
 
     results = {}
 
     # -------------------------
-    # ✅ Semgrep
+    # ✅ SEMGREP
     # -------------------------
     semgrep_file = workdir / "semgrep.json"
-
     try:
         run_cmd(f"semgrep scan {repo_dir} --config auto --json -o {semgrep_file}")
-        semgrep_counts = parse_semgrep(semgrep_file)
+        upload("Semgrep JSON Report", semgrep_file, req["engagement_id"])
         results["semgrep"] = "done"
     except Exception as e:
-        semgrep_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
         results["semgrep"] = "failed"
 
+    semgrep_counts = parse_semgrep(semgrep_file)
+
     # -------------------------
-    # ✅ Trivy
+    # ✅ TRIVY
     # -------------------------
     trivy_file = workdir / "trivy.json"
-
     try:
         run_cmd(f"trivy fs {repo_dir} -f json -o {trivy_file}")
-        trivy_counts = parse_trivy(trivy_file)
+        upload("Trivy Scan", trivy_file, req["engagement_id"])
         results["trivy"] = "done"
     except Exception as e:
-        trivy_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
         results["trivy"] = "failed"
 
+    trivy_counts = parse_trivy(trivy_file)
+
     # -------------------------
-    # ✅ ZAP (optional)
+    # ✅ ZAP
     # -------------------------
-    zap_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    zap_counts = empty_counts()
 
     if target_url:
         try:
@@ -163,7 +160,7 @@ def run_scan(req):
         results["zap"] = "skipped"
 
     # -------------------------
-    # ✅ Summary Table
+    # ✅ SUMMARY (NEW ✅)
     # -------------------------
     summary = [
         {
@@ -187,13 +184,15 @@ def run_scan(req):
     ]
 
     # -------------------------
-    # ✅ Save File
+    # ✅ SAVE FILE (NEW ✅)
     # -------------------------
-    out_dir = Path("/tmp/scan-results")
-    out_dir.mkdir(exist_ok=True)
+    out_dir = Path("/tmp/scan-results") / product_name
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    file_name = f"{product_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    file_name = f"{engagement_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     file_path = out_dir / file_name
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(file_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -206,3 +205,4 @@ def run_scan(req):
         "summary": summary,
         "saved_file": str(file_path)
     }
+``
