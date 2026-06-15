@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, date
 
 # ✅ Celery Config
 celery_app = Celery(
@@ -33,9 +33,54 @@ def dojo_headers():
         "Authorization": f"Token {DOJO_TOKEN}"
     }
 
+# -------------------------
+# ✅ Product + Engagement (OLD WORKING ✅)
+# -------------------------
+
+def get_or_create_product(name):
+    r = requests.get(
+        f"{DOJO_URL}/api/v2/products/",
+        headers=dojo_headers(),
+        params={"name": name}
+    )
+
+    data = r.json()
+
+    if data["count"] > 0:
+        return data["results"][0]["id"]
+
+    r = requests.post(
+        f"{DOJO_URL}/api/v2/products/",
+        headers=dojo_headers(),
+        json={
+            "name": name,
+            "prod_type": 1
+        }
+    )
+
+    return r.json()["id"]
+
+
+def create_engagement(product_id, name):
+    today = date.today().isoformat()
+
+    r = requests.post(
+        f"{DOJO_URL}/api/v2/engagements/",
+        headers=dojo_headers(),
+        json={
+            "name": name,
+            "product": product_id,
+            "status": "In Progress",
+            "engagement_type": "CI/CD",
+            "target_start": today,
+            "target_end": today
+        }
+    )
+
+    return r.json()["id"]
 
 # -------------------------
-# ✅ DefectDojo Upload (IMPORTANT)
+# ✅ Upload (IMPORTANT)
 # -------------------------
 
 def upload(scan_type, file_path, engagement_id):
@@ -54,7 +99,6 @@ def upload(scan_type, file_path, engagement_id):
 
     if r.status_code not in [200, 201]:
         raise Exception(f"Upload failed: {r.text}")
-
 
 # -------------------------
 # ✅ Parsing (NEW ✅)
@@ -94,7 +138,6 @@ def parse_semgrep(file):
         pass
     return counts
 
-
 # -------------------------
 # ✅ MAIN TASK
 # -------------------------
@@ -107,6 +150,10 @@ def run_scan(req):
     engagement_name = req["engagement_name"]
     target_url = req.get("target_url")
 
+    # ✅ CREATE PRODUCT + ENGAGEMENT ✅
+    product_id = get_or_create_product(product_name)
+    engagement_id = create_engagement(product_id, engagement_name)
+
     workdir = Path("/tmp/scan")
     if workdir.exists():
         shutil.rmtree(workdir)
@@ -114,7 +161,6 @@ def run_scan(req):
 
     repo_dir = workdir / "repo"
 
-    # ✅ Clone repo
     run_cmd(f"git clone {repo_url} {repo_dir}")
 
     results = {}
@@ -123,11 +169,13 @@ def run_scan(req):
     # ✅ SEMGREP
     # -------------------------
     semgrep_file = workdir / "semgrep.json"
+
     try:
         run_cmd(f"semgrep scan {repo_dir} --config auto --json -o {semgrep_file}")
-        upload("Semgrep JSON Report", semgrep_file, req["engagement_id"])
+        upload("Semgrep JSON Report", semgrep_file, engagement_id)
         results["semgrep"] = "done"
     except Exception as e:
+        print("SEMGRP ERROR:", str(e))
         results["semgrep"] = "failed"
 
     semgrep_counts = parse_semgrep(semgrep_file)
@@ -136,11 +184,13 @@ def run_scan(req):
     # ✅ TRIVY
     # -------------------------
     trivy_file = workdir / "trivy.json"
+
     try:
         run_cmd(f"trivy fs {repo_dir} -f json -o {trivy_file}")
-        upload("Trivy Scan", trivy_file, req["engagement_id"])
+        upload("Trivy Scan", trivy_file, engagement_id)
         results["trivy"] = "done"
     except Exception as e:
+        print("TRIVY ERROR:", str(e))
         results["trivy"] = "failed"
 
     trivy_counts = parse_trivy(trivy_file)
@@ -154,7 +204,8 @@ def run_scan(req):
         try:
             run_cmd(f"docker run --rm ghcr.io/zaproxy/zaproxy zap-baseline.py -t {target_url}")
             results["zap"] = "done"
-        except:
+        except Exception as e:
+            print("ZAP ERROR:", str(e))
             results["zap"] = "failed"
     else:
         results["zap"] = "skipped"
@@ -205,4 +256,3 @@ def run_scan(req):
         "summary": summary,
         "saved_file": str(file_path)
     }
-``
