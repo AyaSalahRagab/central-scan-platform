@@ -1,26 +1,47 @@
-version: "3.9"
+version: "3.8"
 
 services:
   redis:
-    image: valkey/valkey:9.0.4-alpine
+    image: redis:7-alpine
+    container_name: scanner-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379" # optional, if you need external access
+    volumes:
+      - redis_data:/data
 
   api:
-    build: ./api
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    build: .
+    container_name: scanner-api
+    restart: unless-stopped
     ports:
       - "8000:8000"
-    env_file:
-      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - UPLOAD_DIR=/tmp/security_scans
+      - REPORT_DIR=/app/reports
+      - TRIVY_TEMPLATE=/app/trivy-html.tpl
+    volumes:
+      - reports_data:/app/reports # Persist reports
     depends_on:
       - redis
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
 
   worker:
-    build: ./worker
-    command: celery -A tasks.celery_app worker --loglevel=info
-    env_file:
-      - .env
+    build: .
+    container_name: scanner-worker
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - UPLOAD_DIR=/tmp/security_scans
+      - REPORT_DIR=/app/reports
+      - TRIVY_TEMPLATE=/app/trivy-html.tpl
     volumes:
-      - /tmp:/tmp
-      - /var/run/docker.sock:/var/run/docker.sock
+      - reports_data:/app/reports # Same volume to access report files
     depends_on:
       - redis
+    command: celery -A celery_app worker --loglevel=info --concurrency=2
+
+volumes:
+  redis_data:
+  reports_data:
