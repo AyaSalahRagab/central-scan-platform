@@ -5,8 +5,9 @@ import uuid
 import re
 import json
 import logging
+import requests
+from datetime import datetime, timedelta
 from celery_app import celery_app
-from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,163 @@ TEMPLATE_PATH = os.getenv("TRIVY_TEMPLATE", "trivy-html.tpl")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
+
+# DefectDojo configuration
+DEFECTDOJO_URL = os.getenv("DEFECTDOJO_URL")
+DEFECTDOJO_API_KEY = os.getenv("DEFECTDOJO_API_KEY")
+
+# ----------------------------------------------------------------------
+# DefectDojo helper functions
+# ----------------------------------------------------------------------
+
+
+def defectdojo_request(method, endpoint, **kwargs):
+    """Make an authenticated request to the DefectDojo API."""
+    url = f"{DEFECTDOJO_URL}/{endpoint.lstrip('/')}"
+    headers = {
+        "Authorization": f"Token {DEFECTDOJO_API_KEY}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if "headers" in kwargs:
+        headers.update(kwargs.pop("headers"))
+    response = requests.request(method, url, headers=headers, **kwargs)
+    return response
+
+
+def get_or_create_product_type(name="Security Scans"):
+    """
+    Fetch an existing product type by name, or create a new one.
+    Returns the product type ID.
+    """
+    # Search by name
+    resp = defectdojo_request("GET", f"/product_types/?name={name}")
+    if resp.status_code == 200:
+        data = resp.json()
+        if data["count"] > 0:
+            return data["results"][0]["id"]
+    # Create a new product type
+    resp = defectdojo_request(
+        "POST",
+        "/product_types/",
+        json={"name": name, "description": f"Auto-created: {name}"},
+    )
+    if resp.status_code in (200, 201):
+        return resp.json()["id"]
+    raise Exception(f"Failed to create product type: {resp.text}")
+
+
+def get_or_create_product(product_name):
+    """
+    Fetch an existing product by name, or create a new one.
+    Ensures a product type exists and uses it.
+    """
+    # Search for product
+    resp = defectdojo_request("GET", f"/products/?name={product_name}")
+    if resp.status_code == 200:
+        data = resp.json()
+        if data["count"] > 0:
+            return data["results"][0]["id"]
+
+    # Get (or create) a product type
+    prod_type_id = get_or_create_product_type()
+
+    # Create the product
+    resp = defectdojo_request(
+        "POST",
+        "/products/",
+        json={
+            "name": product_name,
+            "description": f"Auto-created for {product_name}",
+            "prod_type": prod_type_id,  # <-- required field
+        },
+    )
+    if resp.status_code in (200, 201):
+        return resp.json()["id"]
+    raise Exception(f"Failed to create product: {resp.text}")
+
+
+def get_or_create_engagement(product_id, engagement_name):
+    """Fetch an existing engagement by name under a product, or create a new one."""
+    # Search for engagement
+    resp = defectdojo_request(
+        "GET", f"/engagements/?product={product_id}&name={engagement_name}"
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        if data["count"] > 0:
+            return data["results"][0]["id"]
+    # Create engagement
+    payload = {
+        "product": product_id,
+        "name": engagement_name,
+        "description": f"Scan run for {engagement_name}",
+        "engagement_type": "CI/CD",
+        "status": "In Progress",
+        "target_start": datetime.now().strftime("%Y-%m-%d"),
+        "target_end": (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"),
+    }
+    resp = defectdojo_request("POST", "/engagements/", json=payload)
+    if resp.status_code in (200, 201):
+        return resp.json()["id"]
+    raise Exception(f"Failed to create engagement: {resp.text}")
+
+
+def import_scan_to_defectdojo(scan_type, json_file_path, product_name, engagement_name):
+    """
+    Upload a scan JSON file to DefectDojo.
+    Creates product/engagement automatically if they don't exist.
+    """
+    if not DEFECTDOJO_URL or not DEFECTDOJO_API_KEY:
+        logger.warning("DefectDojo credentials not set. Skipping upload.")
+        return
+
+    # Map scanner types to DefectDojo's scan_type values
+    scan_type_mapping = {
+        "opengrep": "Semgrep JSON Report",  # Opengrep uses Semgrep-compatible JSON
+        "trivy": "Trivy Scan",
+    }
+    scan_type = scan_type_mapping.get(scan_type, scan_type)
+
+    # Ensure product and engagement exist
+    product_id = get_or_create_product(product_name)
+    engagement_id = get_or_create_engagement(product_id, engagement_name)
+
+    # Now import the scan
+    url = f"{DEFECTDOJO_URL}/import-scan/"
+    headers = {"Authorization": f"Token {DEFECTDOJO_API_KEY}"}
+    files = {"file": open(json_file_path, "rb")}
+    data = {
+        "scan_type": scan_type,
+        "product_name": product_name,  # or use product_id
+        "engagement_name": engagement_name,  # or use engagement_id
+        "active": "true",
+        "verified": "true",
+        "minimum_severity": "Info",
+        "close_old_findings": "false",
+        "tags": product_name,
+    }
+    try:
+        response = requests.post(
+            url, headers=headers, files=files, data=data, timeout=60
+        )
+        if response.status_code in (200, 201):
+            logger.info(
+                f"✅ Uploaded {scan_type} scan to DefectDojo (engagement: {engagement_name})"
+            )
+        else:
+            logger.error(
+                f"❌ DefectDojo upload failed (status {response.status_code}): {response.text}"
+            )
+    except Exception as e:
+        logger.error(f"Exception during DefectDojo upload: {e}")
+    finally:
+        files["file"].close()
+
+
+# ----------------------------------------------------------------------
+# Celery task
+# ----------------------------------------------------------------------
 
 
 @celery_app.task(bind=True)
@@ -36,7 +194,7 @@ def run_scan(self, project_name, language, app_type, framework, file_bytes, base
         with open(archive_path, "wb") as buffer:
             buffer.write(file_bytes)
 
-        # Extract safely using tarfile (instead of subprocess)
+        # Extract safely using tarfile
         import tarfile
 
         with tarfile.open(archive_path, "r") as tar:
@@ -81,11 +239,6 @@ def run_scan(self, project_name, language, app_type, framework, file_bytes, base
         # --- Trivy SCA ---
         trivy_json_path = os.path.join(workspace_path, "trivy.json")
         trivy_html_path = os.path.join(REPORT_DIR, f"{safe_project_name}-{job_id}.html")
-
-        # Run Trivy only once, generating both JSON and HTML from the same run?
-        # We can generate JSON, parse it, and also generate HTML from the same run using a second command?
-        # Better: run once with JSON, then use a separate conversion or client-side rendering.
-        # But to keep your existing flow, we'll run twice as before (but we can optimize later).
 
         trivy_cmd_json = [
             "trivy",
@@ -142,6 +295,24 @@ def run_scan(self, project_name, language, app_type, framework, file_bytes, base
                             }
                         )
 
+        # --- Upload to DefectDojo ---
+        if DEFECTDOJO_URL and DEFECTDOJO_API_KEY:
+            # Use a unique engagement name per scan run
+            engagement_name = (
+                f"Scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{job_id[:8]}"
+            )
+            if os.path.exists(opengrep_json_path):
+                import_scan_to_defectdojo(
+                    "opengrep", opengrep_json_path, safe_project_name, engagement_name
+                )
+            if os.path.exists(trivy_json_path):
+                import_scan_to_defectdojo(
+                    "trivy", trivy_json_path, safe_project_name, engagement_name
+                )
+        else:
+            logger.info("DefectDojo integration not configured – skipping upload.")
+
+        # Build report URL
         report_url = f"{base_url}static-reports/{safe_project_name}-{job_id}.html"
 
         # Return result
@@ -155,7 +326,7 @@ def run_scan(self, project_name, language, app_type, framework, file_bytes, base
 
     except Exception as e:
         logger.exception("Task failed")
-        # Re-raise to mark task as failed, so status will be FAILURE
+        # Re-raise to mark task as failed
         raise
     finally:
         # Cleanup workspace

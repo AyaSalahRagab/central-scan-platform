@@ -21,6 +21,8 @@ services:
       - UPLOAD_DIR=/tmp/security_scans
       - REPORT_DIR=/app/reports
       - TRIVY_TEMPLATE=/app/trivy-html.tpl
+      - DEFECTDOJO_URL=http://url-ip/api/v2
+      - DEFECTDOJO_API_KEY=api-key
     volumes:
       - reports_data:/app/reports # Persist reports
     depends_on:
@@ -36,6 +38,8 @@ services:
       - UPLOAD_DIR=/tmp/security_scans
       - REPORT_DIR=/app/reports
       - TRIVY_TEMPLATE=/app/trivy-html.tpl
+      - DEFECTDOJO_URL=http://url-ip/api/v2
+      - DEFECTDOJO_API_KEY=api-key
     volumes:
       - reports_data:/app/reports # Same volume to access report files
     depends_on:
