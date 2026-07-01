@@ -202,7 +202,7 @@ def run_scan(self, project_name, language, app_type, framework, file_bytes, base
         import tarfile
 
         with tarfile.open(archive_path, "r") as tar:
-            tar.extractall(path=extract_path, filter="data")  # Python 3.12+
+            tar.extractall(path=extract_path)
 
         vulnerabilities = []
 
