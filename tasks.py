@@ -27,7 +27,6 @@ DEFECTDOJO_API_KEY = os.getenv("DEFECTDOJO_API_KEY")
 # DefectDojo helper functions
 # ----------------------------------------------------------------------
 
-
 def defectdojo_request(method, endpoint, **kwargs):
     """Make an authenticated request to the DefectDojo API."""
     url = f"{DEFECTDOJO_URL}/{endpoint.lstrip('/')}"
@@ -176,7 +175,6 @@ def import_scan_to_defectdojo(scan_type, json_file_path, product_name, engagemen
 # Celery task
 # ----------------------------------------------------------------------
 
-
 @celery_app.task(bind=True)
 def run_scan(self, project_name, language, app_type, framework, file_bytes, base_url):
     # Sanitize project_name
@@ -188,6 +186,12 @@ def run_scan(self, project_name, language, app_type, framework, file_bytes, base
     archive_path = os.path.join(workspace_path, "code.tar")
     extract_path = os.path.join(workspace_path, "src")
     os.makedirs(extract_path, exist_ok=True)
+
+    # Initialize separate summaries for tools
+    summary = {
+        "Opengrep": {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0, "UNKNOWN": 0, "TOTAL": 0},
+        "Trivy": {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0, "UNKNOWN": 0, "TOTAL": 0}
+    }
 
     try:
         # Save uploaded file
@@ -223,13 +227,22 @@ def run_scan(self, project_name, language, app_type, framework, file_bytes, base
             with open(opengrep_json_path, "r") as f:
                 opengrep_data = json.load(f)
                 for finding in opengrep_data.get("results", []):
+                    # Extract and normalize severity
+                    sev_raw = finding.get("extra", {}).get("severity", "UNKNOWN").upper()
+                    sev = "HIGH" if sev_raw == "ERROR" else ("MEDIUM" if sev_raw == "WARNING" else sev_raw)
+                    
+                    if sev not in summary["Opengrep"]:
+                        sev = "UNKNOWN"
+                    
+                    # Update counters
+                    summary["Opengrep"][sev] += 1
+                    summary["Opengrep"]["TOTAL"] += 1
+
                     vulnerabilities.append(
                         {
                             "scanner": "Opengrep",
                             "id": finding.get("check_id"),
-                            "severity": finding.get("extra", {}).get(
-                                "severity", "UNKNOWN"
-                            ),
+                            "severity": sev,
                             "description": finding.get("extra", {}).get("message"),
                             "file": finding.get("path", "").replace(extract_path, ""),
                             "line": finding.get("start", {}).get("line"),
@@ -282,11 +295,20 @@ def run_scan(self, project_name, language, app_type, framework, file_bytes, base
                 trivy_data = json.load(f)
                 for result in trivy_data.get("Results", []):
                     for vuln in result.get("Vulnerabilities", []):
+                        sev = vuln.get("Severity", "UNKNOWN").upper()
+                        
+                        if sev not in summary["Trivy"]:
+                            sev = "UNKNOWN"
+                        
+                        # Update counters
+                        summary["Trivy"][sev] += 1
+                        summary["Trivy"]["TOTAL"] += 1
+
                         vulnerabilities.append(
                             {
                                 "scanner": "Trivy",
                                 "id": vuln.get("VulnerabilityID"),
-                                "severity": vuln.get("Severity", "UNKNOWN"),
+                                "severity": sev,
                                 "description": vuln.get("Title", "No Title"),
                                 "file": result.get("Target", "").replace(
                                     extract_path, ""
@@ -315,12 +337,13 @@ def run_scan(self, project_name, language, app_type, framework, file_bytes, base
         # Build report URL
         report_url = f"{base_url}static-reports/{safe_project_name}-{job_id}.html"
 
-        # Return result
+        # Return result with structured summary
         return {
             "status": "success",
             "project_name": safe_project_name,
             "job_id": job_id,
             "report_url": report_url,
+            "summary": summary,
             "vulnerabilities": vulnerabilities,
         }
 
