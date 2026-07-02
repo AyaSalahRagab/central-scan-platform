@@ -70,10 +70,20 @@ def get_or_create_product(product_name):
     """
     # Search for product
     resp = defectdojo_request("GET", f"/products/?name={product_name}")
+    
+    # 👇 دول السطور الجديدة اللي زودناهم عشان نعرف السبب
+    print(f"--- DEBUG START ---")
+    print(f"Dojo Status Code: {resp.status_code}")
+    print(f"Dojo Response Text: {resp.text}")
+    print(f"--- DEBUG END ---")
+    
     if resp.status_code == 200:
         data = resp.json()
         if data["count"] > 0:
             return data["results"][0]["id"]
+    else:
+        # لو الرد مش 200، بنوقف الـ كود هنا ونطلع الـ سبب الصريح
+        raise Exception(f"DefectDojo API Error! Status: {resp.status_code}, Response: {resp.text}")
 
     # Get (or create) a product type
     prod_type_id = get_or_create_product_type()
@@ -91,7 +101,6 @@ def get_or_create_product(product_name):
     if resp.status_code in (200, 201):
         return resp.json()["id"]
     raise Exception(f"Failed to create product: {resp.text}")
-
 
 def get_or_create_engagement(product_id, engagement_name):
     """Fetch an existing engagement by name under a product, or create a new one."""
